@@ -13,6 +13,14 @@ import xml.etree.ElementTree as ET
 
 
 @dataclasses.dataclass
+class Config:
+    opds_catalog: str
+    stump_url: str
+    stump_api_key: str
+    stump_library_name: str
+
+
+@dataclasses.dataclass
 class Entry:
     id: str | None
     title: str | None
@@ -33,6 +41,34 @@ OPDS_NS = {
 }
 
 
+def parse_config():
+    parser = argparse.ArgumentParser(description="Import OPDS catalog into Stump")
+    parser.add_argument(
+        "--opds-catalog", type=str, required=True, help="URL to OPDS catalog"
+    )
+    parser.add_argument(
+        "--stump-url", type=str, required=True, help="URL to Stump server"
+    )
+    parser.add_argument(
+        "--stump-api-key", type=str, required=True, help="Stump API key"
+    )
+    parser.add_argument(
+        "--stump-library-name",
+        type=str,
+        required=True,
+        help="Name of target Stump library",
+    )
+
+    args = parser.parse_args()
+
+    return Config(
+        opds_catalog=args.opds_catalog,
+        stump_url=args.stump_url,
+        stump_api_key=args.stump_api_key,
+        stump_library_name=args.stump_library_name,
+    )
+
+
 def extract_username_and_password_from_url(
     url: str,
 ) -> tuple[str, tuple[str, str] | None]:
@@ -45,8 +81,10 @@ def extract_username_and_password_from_url(
     return parsed.geturl(), auth
 
 
-def fetch_catalog(url: str) -> list[Entry]:
-    url, auth = extract_username_and_password_from_url(url)
+def get_with_basic_auth(base_url: str, relative_url: str | None = None):
+    url, auth = extract_username_and_password_from_url(base_url)
+    if relative_url:
+        url = urllib.parse.urljoin(base_url, relative_url)
 
     request = urllib.request.Request(url)
 
@@ -54,10 +92,18 @@ def fetch_catalog(url: str) -> list[Entry]:
         b64auth = base64.standard_b64encode(("%s:%s" % auth).encode()).decode()
         request.add_header("Authorization", f"Basic {b64auth}")
 
-    with urllib.request.urlopen(request) as response:
+    return urllib.request.urlopen(request)
+
+
+def fetch_catalog(url: str) -> list[Entry]:
+    with get_with_basic_auth(url) as response:
         xml_data = response.read()
 
-    root = ET.fromstring(xml_data)
+    return parse_catalog(xml_data)
+
+
+def parse_catalog(feed_xml: str) -> list[Entry]:
+    root = ET.fromstring(feed_xml)
 
     entries = []
     for entry_element in root.findall("atom:entry", OPDS_NS):
@@ -122,16 +168,8 @@ def download_catalog_entries(
             print(f"Skipping '{human_id}': {author_path} exists and is not a directory")
             continue
 
-        base_url, auth = extract_username_and_password_from_url(opds_url)
-        download_url = urllib.parse.urljoin(base_url, entry.download_url)
-
-        request = urllib.request.Request(download_url)
-        if auth:
-            b64auth = base64.standard_b64encode(("%s:%s" % auth).encode()).decode()
-            request.add_header("Authorization", f"Basic {b64auth}")
-
         print(f"Downloading '{human_id}'...")
-        with urllib.request.urlopen(request) as response:
+        with get_with_basic_auth(opds_url, entry.download_url) as response:
             content_disposition = response.headers["content-disposition"]
             if not content_disposition:
                 print(f"Skipping '{human_id}': server sent no content-disposition")
@@ -180,52 +218,31 @@ def list_stump_libraries(stump_url: str, stump_api_key: str) -> list[StumpLibrar
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Import OPDS catalog into Stump")
-    parser.add_argument(
-        "--opds-catalog", type=str, required=True, help="URL to OPDS catalog"
-    )
-    parser.add_argument(
-        "--stump-url", type=str, required=True, help="URL to Stump server"
-    )
-    parser.add_argument(
-        "--stump-api-key", type=str, required=True, help="Stump API key"
-    )
-    parser.add_argument(
-        "--stump-library-name",
-        type=str,
-        required=True,
-        help="Name of target Stump library",
-    )
+    config = parse_config()
 
-    args = parser.parse_args()
-
-    config = {
-        "opds_catalog": args.opds_catalog,
-        "stump_url": args.stump_url,
-        "stump_api_key": args.stump_api_key,
-        "stump_library_name": args.stump_library_name,
-    }
-
-    stump_libraries = list_stump_libraries(config["stump_url"], config["stump_api_key"])
+    stump_libraries = list_stump_libraries(config.stump_url, config.stump_api_key)
 
     target_library: StumpLibrary | None = None
     for l in stump_libraries:
-        if l.name == config["stump_library_name"]:
+        if l.name == config.stump_library_name:
             target_library = l
             break
 
     if not target_library:
-        print(f"Could not find library with name: {config["stump_library_name"]!r}")
+        print(f"Could not find library with name: {config.stump_library_name!r}")
         print()
         print("  Found libraries:")
         for l in stump_libraries:
             print(l.name)
         sys.exit(1)
 
-    catalog_entries = fetch_catalog(config["opds_catalog"])
-    download_catalog_entries(
-        config["opds_catalog"], catalog_entries, target_library.path
-    )
+    catalog_entries = fetch_catalog(config.opds_catalog)
+    download_catalog_entries(config.opds_catalog, catalog_entries, target_library.path)
+
+    # TODO: download these to a temporary directory.
+    # then copy them to the library
+    # then scan the library
+    # then copy the metadata
 
 
 if __name__ == "__main__":
