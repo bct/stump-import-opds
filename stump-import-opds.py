@@ -296,7 +296,11 @@ def graphql_request(
     with urllib.request.urlopen(request) as response:
         if verbose:
             print(f"HTTP {response.status}")
-        return json.loads(response.read().decode())
+        result = json.loads(response.read().decode())
+        if "errors" in result:
+            first_error = result["errors"][0]["message"]
+            raise Exception(f"GraphQL query failed: {first_error}")
+        return result
 
 
 def list_stump_libraries(
@@ -318,6 +322,41 @@ def scan_stump_library(
         stump_url, stump_api_key, query, {"id": library_id}, verbose=verbose
     )
     return data["data"]["scanLibrary"]
+
+
+def sync_stump_metadata(
+    stump_url: str, stump_api_key: str, path: str, entry: Entry, *, verbose: bool
+):
+    # find the media's ID in the Stump library
+    query = """query MediaId($path: String!) { mediaByPath(path: $path) { id } }"""
+    data = graphql_request(
+        stump_url, stump_api_key, query, {"path": path}, verbose=verbose
+    )
+    media_id = data["data"]["mediaByPath"]["id"]
+
+    # apply metadata updates
+    query = """
+        mutation UpdateMetadata($id: String!, $update: MediaMetadataInput!) {
+            updateMediaMetadata(id: $id, input: $update) {
+                id
+            }
+        }
+    """
+    update = {}
+    if entry.title:
+        update["title"] = entry.title
+    if entry.author:
+        update["writers"] = [entry.author]
+    if entry.summary:
+        update["summary"] = entry.summary
+
+    graphql_request(
+        stump_url,
+        stump_api_key,
+        query,
+        {"id": media_id, "update": update},
+        verbose=verbose,
+    )
 
 
 def main():
@@ -347,6 +386,7 @@ def main():
 
     catalog_entries = fetch_catalog(config.opds_catalog, verbose=config.verbose)
 
+    print(f"Downloading {len(catalog_entries)} entries...")
     results = download_catalog_entries(
         config.opds_catalog,
         catalog_entries,
@@ -356,6 +396,7 @@ def main():
 
     print_download_results(results)
 
+    print("Scanning Stump library...")
     scan_result = scan_stump_library(
         config.stump_url,
         config.stump_api_key,
@@ -367,10 +408,17 @@ def main():
         print("Stump library scan failed!")
         sys.exit(1)
 
-    # TODO: download these to a temporary directory.
-    # then copy them to the library
-    # then scan the library
-    # then copy the metadata
+    print("Updating Stump metadata...")
+    for entry, result in results:
+        if isinstance(result, DownloadSkipped):
+            continue
+        sync_stump_metadata(
+            config.stump_url,
+            config.stump_api_key,
+            result.path,
+            entry,
+            verbose=config.verbose,
+        )
 
 
 if __name__ == "__main__":
