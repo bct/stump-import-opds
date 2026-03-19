@@ -268,15 +268,22 @@ def determine_output_file_path(
         return "", "author or title is missing"
 
 
-def list_stump_libraries(
-    stump_url: str, stump_api_key: str, *, verbose: bool
-) -> list[StumpLibrary]:
+def graphql_request(
+    stump_url: str,
+    stump_api_key: str,
+    query: str,
+    variables: dict | None = None,
+    *,
+    verbose: bool,
+) -> dict:
     graphql_url = f"{stump_url}/api/graphql"
-    query = """{ libraries { nodes { id name path } } }"""
+    body: dict[str, str | dict] = {"query": query}
+    if variables:
+        body["variables"] = variables
 
     request = urllib.request.Request(
         graphql_url,
-        data=json.dumps({"query": query}).encode(),
+        data=json.dumps(body).encode(),
         headers={
             "Authorization": f"Bearer {stump_api_key}",
             "Content-Type": "application/json",
@@ -289,12 +296,28 @@ def list_stump_libraries(
     with urllib.request.urlopen(request) as response:
         if verbose:
             print(f"HTTP {response.status}")
-        data = json.loads(response.read().decode())
+        return json.loads(response.read().decode())
 
+
+def list_stump_libraries(
+    stump_url: str, stump_api_key: str, *, verbose: bool
+) -> list[StumpLibrary]:
+    query = """{ libraries { nodes { id name path } } }"""
+    data = graphql_request(stump_url, stump_api_key, query, verbose=verbose)
     return [
         StumpLibrary(id=node["id"], name=node["name"], path=node["path"])
         for node in data["data"]["libraries"]["nodes"]
     ]
+
+
+def scan_stump_library(
+    stump_url: str, stump_api_key: str, library_id: str, *, verbose: bool
+) -> bool:
+    query = """mutation ScanLibrary($id: String!) { scanLibrary(id: $id) }"""
+    data = graphql_request(
+        stump_url, stump_api_key, query, {"id": library_id}, verbose=verbose
+    )
+    return data["data"]["scanLibrary"]
 
 
 def main():
@@ -332,6 +355,17 @@ def main():
     )
 
     print_download_results(results)
+
+    scan_result = scan_stump_library(
+        config.stump_url,
+        config.stump_api_key,
+        target_library.id,
+        verbose=config.verbose,
+    )
+
+    if not scan_result:
+        print("Stump library scan failed!")
+        sys.exit(1)
 
     # TODO: download these to a temporary directory.
     # then copy them to the library
