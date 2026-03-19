@@ -7,6 +7,7 @@ import email.message
 import json
 import os
 import sys
+import typing
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -22,6 +23,13 @@ class Config:
 
 
 @dataclasses.dataclass
+class StumpLibrary:
+    id: str
+    name: str
+    path: str
+
+
+@dataclasses.dataclass
 class Entry:
     id: str | None
     title: str | None
@@ -29,12 +37,25 @@ class Entry:
     summary: str | None
     download_url: str | None
 
+    def human_id(self) -> str:
+        if self.author and self.title:
+            return f"{self.author} - {self.title}"
+        if self.id:
+            return self.id
+        return "unidentified entry"
+
 
 @dataclasses.dataclass
-class StumpLibrary:
-    id: str
-    name: str
+class DownloadSuccess:
     path: str
+
+
+@dataclasses.dataclass
+class DownloadSkipped:
+    reason: str
+
+
+DownloadResult: typing.TypeAlias = DownloadSuccess | DownloadSkipped
 
 
 OPDS_NS = {
@@ -165,63 +186,70 @@ def parse_catalog(feed_xml: str) -> tuple[list[Entry], str | None]:
 
 def download_catalog_entries(
     opds_url: str, entries: list[Entry], output_dir: str, *, verbose: bool
-) -> bool:
-    if not os.path.isdir(output_dir):
-        print(f"{output_dir} is not a directory!")
-        return False
-
+) -> list[tuple[Entry, DownloadResult]]:
+    results: list[tuple[Entry, DownloadResult]] = []
     for entry in entries:
-        author = entry.author
-        title = entry.title
-        if not author or not title:
-            human_id = entry.id or "unidentified entry"
-            print(f"Skipping '{human_id}': missing author or title")
-            continue
+        result = download_entry(opds_url, entry, output_dir, verbose=verbose)
+        results.append((entry, result))
 
-        human_id = f"{author} - {title}"
+    return results
 
-        if not entry.download_url:
-            print(f"Skipping '{human_id}': no download URL")
-            continue
 
+def download_entry(
+    opds_url: str, entry: Entry, output_dir: str, *, verbose: bool
+) -> DownloadResult:
+    if not entry.download_url:
+        return DownloadSkipped(reason="no download URL")
+
+    if verbose:
+        print(f"Downloading '{entry.human_id()}'...")
+    with get_with_basic_auth(opds_url, entry.download_url, verbose=verbose) as response:
         if verbose:
-            print(f"Downloading '{human_id}'...")
-        with get_with_basic_auth(
-            opds_url, entry.download_url, verbose=verbose
-        ) as response:
-            if verbose:
-                print(f"HTTP {response.status}")
+            print(f"HTTP {response.status}")
 
-            content_disposition = response.headers["content-disposition"]
-            if not content_disposition:
-                print(f"Skipping '{human_id}': server sent no content-disposition")
+        content_disposition = response.headers["content-disposition"]
+        if not content_disposition:
+            return DownloadSkipped(reason="server sent no content-disposition")
+
+        orig_filename = get_original_filename(content_disposition)
+        if not orig_filename:
+            return DownloadSkipped(reason="server provided no original filename")
+
+        file_path, err = determine_output_file_path(entry, orig_filename)
+        if err is not None:
+            return DownloadSkipped(reason=err)
+
+        file_path = os.path.join(output_dir, file_path)
+
+        file_dir = os.path.dirname(file_path)
+        try:
+            os.makedirs(file_dir, exist_ok=True)
+        except FileExistsError:
+            return DownloadSkipped(reason=f"{file_dir} exists and is not a directory")
+
+        if os.path.exists(file_path):
+            return DownloadSkipped(reason="file already exists")
+
+        with open(file_path, "wb") as f:
+            f.write(response.read())
+
+        return DownloadSuccess(path=file_path)
+
+
+def print_download_results(results: list[tuple[Entry, DownloadResult]]):
+    success_count = 0
+    for _, result in results:
+        if isinstance(result, DownloadSuccess):
+            success_count += 1
+
+    print(f"Successfully downloaded {success_count} entries")
+
+    if success_count != len(results):
+        print("Some downloads were skipped:")
+        for entry, result in results:
+            if isinstance(result, DownloadSuccess):
                 continue
-
-            orig_filename = get_original_filename(content_disposition)
-            if not orig_filename:
-                print(f"Skipping '{human_id}': server provided no original filename")
-                continue
-
-            file_path = determine_output_file_path(entry, orig_filename)
-            file_path = os.path.join(output_dir, file_path)
-
-            file_dir = os.path.dirname(file_path)
-            try:
-                os.makedirs(file_dir, exist_ok=True)
-            except FileExistsError:
-                print(
-                    f"Skipping '{human_id}': {file_dir} exists and is not a directory"
-                )
-                continue
-
-            if os.path.exists(file_path):
-                print(f"Skipping '{human_id}': file already exists")
-                continue
-
-            with open(file_path, "wb") as f:
-                f.write(response.read())
-
-    return True
+            print(f"{entry.human_id()}: {result.reason}")
 
 
 def get_original_filename(content_disposition: str) -> str | None:
@@ -230,9 +258,14 @@ def get_original_filename(content_disposition: str) -> str | None:
     return msg.get_filename()
 
 
-def determine_output_file_path(entry: Entry, orig_filename: str) -> str:
+def determine_output_file_path(
+    entry: Entry, orig_filename: str
+) -> tuple[str, str | None]:
     orig_extension = orig_filename.rsplit(".", 1)[-1]
-    return f"{entry.author}/{entry.title}.{orig_extension}"
+    if entry.author and entry.title:
+        return f"{entry.author}/{entry.title}.{orig_extension}", None
+    else:
+        return "", "author or title is missing"
 
 
 def list_stump_libraries(
@@ -285,14 +318,20 @@ def main():
             print(l.name)
         sys.exit(1)
 
+    if not os.path.isdir(target_library.path):
+        print(f"Target library path {target_library.path} is not a directory!")
+        sys.exit(1)
+
     catalog_entries = fetch_catalog(config.opds_catalog, verbose=config.verbose)
 
-    download_catalog_entries(
+    results = download_catalog_entries(
         config.opds_catalog,
         catalog_entries,
         target_library.path,
         verbose=config.verbose,
     )
+
+    print_download_results(results)
 
     # TODO: download these to a temporary directory.
     # then copy them to the library
