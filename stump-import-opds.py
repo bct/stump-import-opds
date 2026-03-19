@@ -36,6 +36,8 @@ class Entry:
     author: str | None
     summary: str | None
     download_url: str | None
+    series: str | None
+    series_position: int | None
 
     def human_id(self) -> str:
         if self.author and self.title:
@@ -168,12 +170,28 @@ def parse_catalog(feed_xml: str) -> tuple[list[Entry], str | None]:
         )
         download_url = link_element.get("href") if link_element is not None else None
 
+        series_element = entry_element.find("./atom:meta[@id='series']", OPDS_NS)
+        series = series_element.text if series_element is not None else None
+
+        series_position_element = entry_element.find(
+            "./atom:meta[@refines='#series']", OPDS_NS
+        )
+        series_position = (
+            series_position_element.text
+            if series_position_element is not None
+            else None
+        )
+        if series_position is not None:
+            series_position = int(float(series_position))
+
         entry = Entry(
             id=id,
             title=title,
             author=author,
             download_url=download_url,
             summary=summary,
+            series=series,
+            series_position=series_position,
         )
         entries.append(entry)
 
@@ -349,6 +367,10 @@ def sync_stump_metadata(
         update["writers"] = [entry.author]
     if entry.summary:
         update["summary"] = entry.summary
+    if entry.series:
+        update["series"] = entry.series
+    if entry.series_position:
+        update["number"] = entry.series_position
 
     graphql_request(
         stump_url,
